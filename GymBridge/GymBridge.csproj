@@ -32,9 +32,15 @@
   </PropertyGroup>
   <ItemGroup>
     <!-- MMHOOK first -->
+    <Reference Include="CelesteTAS-EverestInterop">
+      <HintPath>..\..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Celeste\Mods\CelesteTAS\bin\CelesteTAS-EverestInterop.dll</HintPath>
+		<Private>False</Private>
+		<Aliases>CelesteTAS</Aliases>
+    </Reference>
     <Reference Include="Microsoft.Bcl.AsyncInterfaces, Version=9.0.0.9, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51, processorArchitecture=MSIL">
       <HintPath>..\packages\Microsoft.Bcl.AsyncInterfaces.9.0.9\lib\net462\Microsoft.Bcl.AsyncInterfaces.dll</HintPath>
     </Reference>
+    <Reference Include="Microsoft.CSharp" />
     <Reference Include="MMHOOK_Celeste">
       <HintPath>C:\Program Files (x86)\Steam\steamapps\common\Celeste\MMHOOK_Celeste.dll</HintPath>
     </Reference>

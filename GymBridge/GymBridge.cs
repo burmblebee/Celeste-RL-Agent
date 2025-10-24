@@ -1,5 +1,8 @@
 ﻿extern alias celeste;
+extern alias CelesteTAS; // 👈 reference to your CelesteTAS-EverestInterop.dll
 extern alias everest;
+using CelesteTAS::TAS;
+using CelesteTAS::TAS.Input;
 using Microsoft.Xna.Framework;
 using Newtonsoft.Json;
 using System;
@@ -11,6 +14,10 @@ using System.Text;
 using System.Threading;
 using CelesteBase = celeste::Celeste;
 using EverestAPI = everest::Celeste.Mod;
+using TASCommands = CelesteTAS::TAS.Input.Commands;
+using TASInput = CelesteTAS::TAS.Input;
+using CelesteTAS::TAS.Input;
+
 
 namespace GymBridge
 {
@@ -23,7 +30,6 @@ namespace GymBridge
         private Thread listenerThread;
         private int pendingAction = 0;
 
-        // Progress tracking
         private float cumulativeReward = 0f;
         private int deathCount = 0;
         private readonly string progressPath = Path.Combine("GymBridgeProgress.json");
@@ -68,165 +74,59 @@ namespace GymBridge
 
         private void Player_Update(On.Celeste.Player.orig_Update orig, CelesteBase.Player self)
         {
-            float posX = self.Position.X;
-            float posY = self.Position.Y;
-
             ApplyAction(self, pendingAction);
             orig(self);
 
             var level = self.Scene as CelesteBase.Level;
             if (level == null) return;
 
-            posX = self.Position.X;
-            posY = self.Position.Y;
-            float velX = self.Speed.X;
-            float velY = self.Speed.Y;
-            bool canDash = self.CanDash;
-            bool onGround = self.OnGround();
-            bool onWall = self.CollideCheck<CelesteBase.Solid>(self.Position + new Vector2(-1, 0))
-                       || self.CollideCheck<CelesteBase.Solid>(self.Position + new Vector2(1, 0));
-            float stamina = self.Stamina;
-            bool dead = self.Dead;
+            SendObservation(level, self);
 
-            if (dead)
-            {
-                deathCount++;
-                cumulativeReward -= 10f;
-                SaveProgress();
-            }
-
-            // Vision grid
-            int gridWidth = 13;
-            int gridHeight = 7;
-            float spacingX = 104f; // ~1/3 screen horizontally
-            float spacingY = 60f;  // ~1/3 vertically
-            int halfW = gridWidth / 2;
-            int halfH = gridHeight / 2;
-
-            List<float> solidGrid = new List<float>();
-            List<float> dangerGrid = new List<float>();
-
-            foreach (var dy in Enumerable.Range(-halfH, gridHeight))
-            {
-                foreach (var dx in Enumerable.Range(-halfW, gridWidth))
-                {
-                    Vector2 checkPos = self.Position + new Vector2(dx * spacingX, dy * spacingY);
-
-                    bool solid = self.CollideCheck<CelesteBase.Solid>(checkPos);
-                    solidGrid.Add(solid ? 1f : 0f);
-
-                    bool danger = false;
-                    foreach (var entity in level.Entities)
-                    {
-                        if (entity is CelesteBase.Spikes spikes)
-                        {
-                            Rectangle rect = new Rectangle(
-                                (int)spikes.Position.X,
-                                (int)spikes.Position.Y,
-                                (int)spikes.Width,
-                                (int)spikes.Height
-                            );
-                            if (rect.Contains((int)checkPos.X, (int)checkPos.Y))
-                            {
-                                danger = true;
-                                break;
-                            }
-                        }
-                    }
-                    dangerGrid.Add(danger ? 1f : 0f);
-                }
-            }
-
-            List<float> features = new List<float>
-            {
-                posX, posY, velX, velY,
-                canDash ? 1 : 0,
-                onGround ? 1 : 0,
-                onWall ? 1 : 0,
-                dead ? 1 : 0,
-                stamina
-            };
-            features.Add(grabToggled ? 1 : 0); // isGrabbing
-            features.AddRange(solidGrid);
-            features.AddRange(dangerGrid);
-
-            if (stream != null && stream.CanWrite)
-            {
-                try
-                {
-                    string json = JsonConvert.SerializeObject(new { features });
-                    byte[] data = Encoding.UTF8.GetBytes(json + "\n");
-                    stream.Write(data, 0, data.Length);
-                }
-                catch (SocketException ex)
-                {
-                    EverestAPI.Logger.Log(EverestAPI.LogLevel.Warn, "GymBridge", $"Socket error: {ex.Message}");
-                    try { stream?.Close(); } catch { }
-                    try { client?.Close(); } catch { }
-                    stream = null;
-                    client = null;
-                }
-            }
         }
 
         private bool grabToggled = false;
 
         private void ApplyAction(CelesteBase.Player self, int action)
         {
-            switch (action)
+            bool left = false, right = false, up = false, down = false, jump = false, dash = false;
+            if (action == 1) left = true;
+            else if (action == 2) right = true;
+            else if (action == 3) jump = true;
+            else if (action == 4) dash = true;
+            else if (action == 5) grabToggled = !grabToggled;
+
+            // Build a fake TAS input line like the ones in .tas files
+            string tasLine = BuildTASLine(left, right, up, down, jump, dash, grabToggled);
+
+            if (InputFrame.TryParse(tasLine, "GymBridge", 0, 0, null, out var frame))
             {
-                case 1:
-                    self.MoveH(-1); // Move left
-                    break;
-
-                case 2:
-                    self.MoveH(1); // Move right
-                    break;
-
-                case 3:
-                    if (self.OnGround())
-                        self.Jump();
-                    break;
-
-                case 4:
-                    if (self.CanDash)
-                    {
-                        self.DashDir = Vector2.UnitX;
-                        self.StartDash();
-                    }
-                    break;
-
-                case 5:
-                    // Toggle grab mode
-                    grabToggled = !grabToggled;
-                    break;
-            }
-
-            // Handle grab/climb toggle behavior
-            if (grabToggled)
-            {
-                bool touchingWall = self.CollideCheck<CelesteBase.Solid>(self.Position + new Vector2(-1, 0)) ||
-                                    self.CollideCheck<CelesteBase.Solid>(self.Position + new Vector2(1, 0));
-
-                // Only enter climb if touching a wall and not already climbing
-                if (touchingWall && self.StateMachine.State != CelesteBase.Player.StClimb)
-                {
-                    self.StateMachine.State = CelesteBase.Player.StClimb;
-                }
-                else if (!touchingWall && self.StateMachine.State == CelesteBase.Player.StClimb)
-                {
-                    self.StateMachine.State = CelesteBase.Player.StNormal;
-                }
-            }
-            else
-            {
-                // Release grab if toggled off and currently climbing
-                if (self.StateMachine.State == CelesteBase.Player.StClimb)
-                {
-                    self.StateMachine.State = CelesteBase.Player.StNormal;
-                }
+                InputHelper.FeedInputs(frame);
             }
         }
+
+        private string BuildTASLine(bool left, bool right, bool up, bool down, bool jump, bool dash, bool grab)
+        {
+            // Construct a TAS input string such as "1,1,1,1,1,1,1"
+            // The syntax matches CelesteTAS format, e.g. "L, J, D, G"
+            List<string> parts = new List<string>();
+            if (left) parts.Add("L");
+            if (right) parts.Add("R");
+            if (up) parts.Add("U");
+            if (down) parts.Add("D");
+            if (jump) parts.Add("J");
+            if (dash) parts.Add("X");
+            if (grab) parts.Add("G");
+
+            // Default to 1 frame if nothing else
+            parts.Add("1");
+
+            return string.Join(", ", parts);
+        }
+
+
+
+
+
 
 
         private void ListenForActions()
@@ -274,6 +174,111 @@ namespace GymBridge
 
             File.WriteAllText(progressPath, JsonConvert.SerializeObject(data, Formatting.Indented));
         }
+        private void SendMessage(object obj)
+        {
+            if (stream == null || !stream.CanWrite)
+                return;
+
+            try
+            {
+                string json = JsonConvert.SerializeObject(obj);
+                byte[] bytes = Encoding.UTF8.GetBytes(json + "\n");
+                stream.Write(bytes, 0, bytes.Length);
+                stream.Flush();
+            }
+            catch (Exception ex)
+            {
+                EverestAPI.Logger.Log(EverestAPI.LogLevel.Warn, "GymBridge", $"Send error: {ex.Message}");
+            }
+        }
+
+        private void SendObservation(CelesteBase.Level level, CelesteBase.Player player)
+        {
+            if (stream == null || !stream.CanWrite || player == null)
+                return;
+
+            var pos = player.Position;
+            const int gridWidth = 16;
+            const int gridHeight = 9;
+            const int tileSize = 8;
+            int halfW = gridWidth / 2;
+            int halfH = gridHeight / 2;
+
+            // Compute grid pixel bounds
+            float originX = pos.X - halfW * tileSize;
+            float originY = pos.Y - halfH * tileSize;
+            float endX = pos.X + halfW * tileSize;
+            float endY = pos.Y + halfH * tileSize;
+
+            // Build grid
+            char[,] grid = new char[gridHeight, gridWidth];
+            for (int y = 0; y < gridHeight; y++)
+                for (int x = 0; x < gridWidth; x++)
+                    grid[y, x] = '.'; // empty space
+
+            // Static solids (walls, ground, etc.)
+            var solids = level.Tracker.GetEntities<CelesteBase.Solid>();
+            foreach (CelesteBase.Solid s in solids)
+            {
+                var rect = s.Collider?.Bounds ?? Rectangle.Empty;
+                for (int gx = 0; gx < gridWidth; gx++)
+                {
+                    for (int gy = 0; gy < gridHeight; gy++)
+                    {
+                        float worldX = originX + gx * tileSize + tileSize / 2f;
+                        float worldY = originY + gy * tileSize + tileSize / 2f;
+                        if (rect.Contains((int)worldX, (int)worldY))
+                            grid[gy, gx] = '#';
+                    }
+                }
+            }
+
+            // Mark player center
+            grid[halfH, halfW] = '@';
+
+            // Convert grid to string array
+            var gridStrings = Enumerable.Range(0, gridHeight)
+                .Select(y => new string(Enumerable.Range(0, gridWidth).Select(x => grid[y, x]).ToArray()))
+                .ToArray();
+
+            // Build JSON observation
+            var obs = new
+            {
+                Room = level.Session?.Level,
+                Player = new
+                {
+                    X = pos.X,
+                    Y = pos.Y,
+                    Speed = new { player.Speed.X, player.Speed.Y },
+                    Dashes = player.Dashes,
+                    GrabToggled = player.Holding != null,
+                    OnGround = player.OnGround(),
+                    Facing = player.Facing.ToString()
+                },
+                GridOrigin = new
+                {
+                    X = originX,
+                    Y = originY,
+                    Width = gridWidth * tileSize,
+                    Height = gridHeight * tileSize
+                },
+                Grid = gridStrings
+            };
+
+            try
+            {
+                string json = JsonConvert.SerializeObject(obs);
+                byte[] msg = Encoding.UTF8.GetBytes(json + "\n");
+                stream.Write(msg, 0, msg.Length);
+            }
+            catch (Exception e)
+            {
+                EverestAPI.Logger.Log(EverestAPI.LogLevel.Info, "GymBridge", $"Failed to send observation: {e}");
+            }
+        }
+
+
+
 
         private void LoadProgress()
         {
