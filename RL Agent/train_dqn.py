@@ -17,10 +17,10 @@ from celeste_env import CelesteEnv
 BATCH_SIZE = 64
 GAMMA = 0.99
 LR = 1e-4
-EPS_DECAY = 5000
-EPS_START = 0.9
-EPS_END   = 0.1
-TARGET_UPDATE = 1000        # kept as a backup hard-sync
+EPS_DECAY = 1000
+EPS_START = 1.0
+EPS_END   = 0.05
+TARGET_UPDATE = 1000       
 MEMORY_CAPACITY = 200000
 MAX_EPISODES = 2000
 PROGRESS_FILE = "checkpoints/progress.pkl"
@@ -28,16 +28,16 @@ CHECKPOINT_FILE = "checkpoints/checkpoint.pth"
 CSV_LOG = "checkpoints/training_log.csv"
 
 # PER hyperparams
-PER_ALPHA = 0.6    # how much prioritization is used (0 = uniform)
+PER_ALPHA = 0.6   
 PER_BETA_START = 0.4
-PER_BETA_FRAMES = 200000  # anneal beta to 1.0 over this many steps
+PER_BETA_FRAMES = 200000  
 EPS_PRIORITY = 1e-6
 
 # training tweaks
-ACTION_REPEAT = 3       # sticky actions: repeat each chosen action for N frames
+ACTION_REPEAT = 3       
 GRAD_CLIP = 0.5
-TAU = 0.005             # soft target update factor
-Q_REG = 1e-6            # regularization for Q-values
+TAU = 0.005             
+Q_REG = 1e-6            
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -47,7 +47,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ==========================================================
 # Each action is an array of 5 floats: [moveX, moveY, jump, dash, grab]
 ACTIONS = [
-    # np.array([0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),   # noop
+    np.array([0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),   # noop
     np.array([-1.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),  # left
     np.array([1.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),   # right
     np.array([0.0, 0.0, 1.0, 0.0, 0.0], dtype=np.float32),   # jump
@@ -107,7 +107,7 @@ class DuelingDQN(nn.Module):
         super().__init__()
         # shared feature extractor
         self.feature = nn.Sequential(
-            nn.Linear(state_dim, 256),
+            nn.Linear(266, 256),
             nn.ReLU(),
         )
         # value head
@@ -127,12 +127,11 @@ class DuelingDQN(nn.Module):
         f = self.feature(x)
         v = self.value_stream(f)
         a = self.adv_stream(f)
-        # combine: Q = V + (A - mean(A))
         return v + a - a.mean(dim=1, keepdim=True)
 
 
 # ==========================================================
-# Lightweight Proportional PER (not super-optimized but simple)
+# Lightweight Proportional PER
 # Stores transitions and priorities in parallel arrays.
 # ==========================================================
 class PrioritizedReplay:
@@ -202,7 +201,7 @@ def soft_update(target, source, tau):
         tparam.data.copy_(tparam.data * (1.0 - tau) + sparam.data * tau)
 
 
-# Simple state normalization (env already scales some fields),
+# Simple state normalization
 # this function ensures dtype and small clipping if needed.
 def preprocess_state(state):
     s = np.array(state, dtype=np.float32)
@@ -243,10 +242,7 @@ def optimize_model(memory: PrioritizedReplay, policy_net, target_net, optimizer,
     q_taken = q_values.gather(1, action_idx)  # (B,1)
 
     with torch.no_grad():
-        # Double DQN: select next action with policy_net, evaluate with target_net
-        next_policy_q = policy_net(next_state)
-        next_actions = next_policy_q.argmax(dim=1, keepdim=True)
-        next_target_q = target_net(next_state).gather(1, next_actions)
+        next_target_q = target_net(next_state).max(dim=1, keepdim=True)[0]
         target_q = reward + GAMMA * (1.0 - done) * next_target_q
 
     # element-wise TD error
@@ -296,7 +292,7 @@ def main():
 
     env = CelesteEnv()
     state, _ = env.reset()
-    state_dim = env.observation_space.shape[0]
+    state_dim = 266
 
     policy_net = DuelingDQN(state_dim, NUM_ACTIONS).to(device)
     target_net = DuelingDQN(state_dim, NUM_ACTIONS).to(device)
@@ -309,7 +305,6 @@ def main():
     frame_idx = 0
     episode_rewards = []
 
-    # optionally load progress/checkpoint
     if os.path.exists(PROGRESS_FILE):
         with open(PROGRESS_FILE, "rb") as f:
             episode_rewards = pickle.load(f)
@@ -335,10 +330,9 @@ def main():
         losses = []
 
         done = False
-        for t in range(10000):  # long horizon per episode
+        for t in range(10000): 
             # choose action
             action_vec, eps, action_idx = select_action(state, steps_done, policy_net)
-
             # sticky action repeat
             accumulated_reward = 0.0
             next_s = None
@@ -351,7 +345,6 @@ def main():
                 if term or trunc:
                     terminated, truncated = term, trunc
                     break
-                # if not done, continue repeating
 
             done_flag = terminated or truncated
             next_s = preprocess_state(next_raw)
