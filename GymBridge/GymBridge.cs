@@ -1,12 +1,11 @@
 extern alias celeste;
-extern alias CelesteTAS;
 extern alias everest;
+extern alias CelesteTAS;
 
 using celeste::Monocle;
 using CelesteTAS::TAS;
 using CelesteTAS::TAS.Input;
 using Microsoft.Xna.Framework;
-using MonoMod.Utils;
 using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
@@ -35,49 +34,68 @@ namespace GymBridge
         private Thread listenerThread;
         private static FieldInfo grabToggleField;
 
-
         private float cumulativeReward = 0f;
         private int deathCount = 0;
-        private readonly string progressPath = Path.Combine("GymBridgeProgress.json");
+
+        private static readonly string BaseSaveDir =
+            @"C:\Users\abbyo\OneDrive\Documents\ai class\Final Project\GymBridge";
+
+        private readonly string progressPath =
+            Path.Combine(BaseSaveDir, "GymBridgeProgress.json");
+
+        private readonly string demoPath =
+            Path.Combine(BaseSaveDir, "GymBridgeDemo.json");
 
         private InputData latestInput = new InputData();
+
+        private readonly List<RecordedFrame> demoFrames = new List<RecordedFrame>();
+        private bool receivedExternalInput = false;
+        private DateTime lastExternalInput = DateTime.MinValue;
 
         public GymBridgeModule() => Instance = this;
 
         public override void Load()
         {
-            EverestAPI.Logger.Log(EverestAPI.LogLevel.Info, "GymBridge", "Loaded ✅");
+            EverestAPI.Logger.Log(EverestAPI.LogLevel.Info, "GymBridge", "Loaded");
             On.Celeste.Player.Update += Player_Update;
 
-
+            // Enable TAS system
             TASManager.EnableRun();
-            EverestAPI.Logger.Log(EverestAPI.LogLevel.Info, "GymBridge", "TAS system enabled ✅");
+            EverestAPI.Logger.Log(EverestAPI.LogLevel.Info, "GymBridge", "TAS system enabled");
 
-            // Access the private static field 'grabToggle' in Celeste.Input
+            // Reflection for grabToggle
             var inputType = typeof(celeste::Celeste.Input);
             grabToggleField = inputType.GetField("grabToggle", BindingFlags.NonPublic | BindingFlags.Static);
 
             if (grabToggleField == null)
-                EverestAPI.Logger.Log(EverestAPI.LogLevel.Warn, "GymBridge", "Failed to find Celeste.Input.grabToggle ⚠️");
+                EverestAPI.Logger.Log(EverestAPI.LogLevel.Warn, "GymBridge", "Failed to find Celeste.Input.grabToggle");
             else
-                EverestAPI.Logger.Log(EverestAPI.LogLevel.Info, "GymBridge", "Found Celeste.Input.grabToggle ✅");
+                EverestAPI.Logger.Log(EverestAPI.LogLevel.Info, "GymBridge", "Found Celeste.Input.grabToggle");
 
-
+            // Connect to Python agent
             try
             {
                 client = new TcpClient("127.0.0.1", 5000);
                 stream = client.GetStream();
-                EverestAPI.Logger.Log(EverestAPI.LogLevel.Info, "GymBridge", "Connected to Python agent ✅");
-
-                listenerThread = new Thread(ListenForActions)
-                {
-                    IsBackground = true
-                };
+                listenerThread = new Thread(ListenForActions) { IsBackground = true };
                 listenerThread.Start();
+                EverestAPI.Logger.Log(EverestAPI.LogLevel.Info, "GymBridge", "Connected to Python agent");
             }
             catch
             {
-                EverestAPI.Logger.Log(EverestAPI.LogLevel.Warn, "GymBridge", "Python agent not running ⚠️");
+                EverestAPI.Logger.Log(EverestAPI.LogLevel.Warn, "GymBridge", "Python agent not running");
+            }
+
+            try
+            {
+                Directory.CreateDirectory(BaseSaveDir);
+                File.WriteAllText(progressPath, "{ \"test\": true }");
+                EverestAPI.Logger.Log(EverestAPI.LogLevel.Info, "GymBridge", "Write test executed");
+            }
+            catch (Exception e)
+            {
+                EverestAPI.Logger.Log(EverestAPI.LogLevel.Warn, "GymBridge",
+                    $"Failed creating save directory: {e}");
             }
 
             LoadProgress();
@@ -86,27 +104,40 @@ namespace GymBridge
         public override void Unload()
         {
             On.Celeste.Player.Update -= Player_Update;
-            SaveProgress();
 
             try { stream?.Close(); } catch { }
             try { client?.Close(); } catch { }
 
             if (listenerThread != null && listenerThread.IsAlive)
                 listenerThread.Abort();
+
+            try
+            {
+                File.WriteAllText(demoPath,
+                    JsonConvert.SerializeObject(demoFrames, Formatting.Indented));
+            }
+            catch (Exception e)
+            {
+                EverestAPI.Logger.Log(EverestAPI.LogLevel.Warn, "GymBridge", $"Failed to save demo: {e}");
+            }
         }
 
+        private int saveTickCounter = 0;
 
         private void Player_Update(On.Celeste.Player.orig_Update orig, CelesteBase.Player self)
         {
             var level = self.Scene as CelesteBase.Level;
-            if (level == null)
-                return;
+            if (level == null) return;
 
             orig(self);
             ApplyDirectInputs(self, latestInput, level);
-
-
             SendObservation(level, self);
+
+            if (++saveTickCounter >= 120)
+            {
+                saveTickCounter = 0;
+                SaveProgress(self);
+            }
         }
 
         private bool prevJump = false;
@@ -115,38 +146,19 @@ namespace GymBridge
 
         private void ApplyDirectInputs(celeste::Celeste.Player self, InputData input, celeste::Celeste.Level level)
         {
-            const float runAccel = 1000f;
-            const float maxRunSpeed = 90f;
-            const float airAccel = 400f;
             const float jumpSpeed = -210f;
-            const float gravity = 900f;
 
-            // --- Movement ---
-            //float targetSpeedX = input.MoveX * maxRunSpeed;
-            //float accel = self.OnGround() ? runAccel : airAccel;
-            //self.Speed.X = Calc.Approach(self.Speed.X, targetSpeedX, accel * (float)Engine.DeltaTime);
             self.MoveH(input.MoveX);
 
+            bool wallLeft = self.CollideCheck<celeste::Celeste.Solid>(self.Position - Vector2.UnitX);
+            bool wallRight = self.CollideCheck<celeste::Celeste.Solid>(self.Position + Vector2.UnitX);
 
-            // Apply gravity
-            //if (!self.OnGround() && !input.Grab)
-            //    self.Speed.Y = Calc.Approach(self.Speed.Y, 160f, gravity * (float)Engine.DeltaTime);
-
-            bool wallOnLeft = self.CollideCheck<celeste::Celeste.Solid>(self.Position - Vector2.UnitX);
-            bool wallOnRight = self.CollideCheck<celeste::Celeste.Solid>(self.Position + Vector2.UnitX);
-            bool touchingWall = wallOnLeft || wallOnRight;
-
-            // --- Climb ---
-            //SetGrabToggle(input.Grab);
             SetGrabToggle(true);
-            if(input.MoveY != 0 && touchingWall)
+            if (input.MoveY != 0 && (wallLeft || wallRight))
             {
-                //self.Speed.Y = input.MoveY * 60f;
                 self.MoveV(input.MoveY);
             }
 
-
-            // --- Jump ---
             if (input.Jump && !prevJump)
             {
                 if (self.OnGround())
@@ -154,42 +166,29 @@ namespace GymBridge
                     self.Jump();
                     self.Speed.Y = jumpSpeed;
                 }
-                else
+                else if (wallLeft || wallRight)
                 {
-                    bool wallLeft = self.CollideCheck<celeste::Celeste.Solid>(self.Position - Vector2.UnitX);
-                    bool wallRight = self.CollideCheck<celeste::Celeste.Solid>(self.Position + Vector2.UnitX);
-
-                    if (input.Grab && (wallLeft || wallRight))
-                    {
-                        float wallDir = wallRight ? 1f : -1f;
-                        self.Speed.X = -wallDir * 120f;
-                        self.Speed.Y = jumpSpeed;
-                        self.Jump();
-                        self.Stamina = Math.Max(0, self.Stamina - 20f);
-                    }
+                    float wallDir = wallRight ? 1f : -1f;
+                    self.Speed.X = -wallDir * 120f;
+                    self.Speed.Y = jumpSpeed;
+                    self.Jump();
+                    self.Stamina = Math.Max(0, self.Stamina - 20f);
                 }
             }
 
-            // --- Dash ---
             if (input.Dash && !prevDash && self.Dashes > 0 && !self.DashAttacking)
             {
-                Vector2 dashDir = new Vector2(input.MoveX, input.MoveY);
+                Vector2 dir = new Vector2(input.MoveX, input.MoveY);
+                if (dir.LengthSquared() < 0.01f)
+                    dir = self.Facing == celeste::Celeste.Facings.Right ? Vector2.UnitX : -Vector2.UnitX;
 
-                // If too small, use facing
-                if (dashDir.LengthSquared() < 0.01f)
-                    dashDir = self.Facing == celeste::Celeste.Facings.Right ? Vector2.UnitX : -Vector2.UnitX;
-
-                if (Math.Abs(dashDir.X) < 0.05f) dashDir.X = 0f;
-                if (Math.Abs(dashDir.Y) < 0.05f) dashDir.Y = 0f;
-
-                dashDir.Normalize();
-                self.DashDir = dashDir;
+                dir.Normalize();
+                self.DashDir = dir;
                 self.StartDash();
                 self.StateMachine.State = celeste::Celeste.Player.StDash;
-                self.Speed = dashDir * 240f;
+                self.Speed = dir * 240f;
             }
 
-            // --- Facing direction ---
             if (input.MoveX > 0.1f)
                 self.Facing = celeste::Celeste.Facings.Right;
             else if (input.MoveX < -0.1f)
@@ -212,7 +211,6 @@ namespace GymBridge
                 grabToggleField.SetValue(null, value);
         }
 
-
         private void ListenForActions()
         {
             byte[] buffer = new byte[1024];
@@ -222,10 +220,10 @@ namespace GymBridge
             {
                 while (true)
                 {
-                    int bytesRead = stream.Read(buffer, 0, buffer.Length);
-                    if (bytesRead <= 0) break;
+                    int bytes = stream.Read(buffer, 0, buffer.Length);
+                    if (bytes <= 0) break;
 
-                    sb.Append(Encoding.UTF8.GetString(buffer, 0, bytesRead));
+                    sb.Append(Encoding.UTF8.GetString(buffer, 0, bytes));
 
                     while (sb.ToString().Contains("\n"))
                     {
@@ -236,36 +234,57 @@ namespace GymBridge
                         {
                             var msg = JsonConvert.DeserializeObject<Dictionary<string, float[]>>(line);
                             if (msg != null && msg.ContainsKey("actions"))
+                            {
                                 latestInput = new InputData(msg["actions"]);
+                                receivedExternalInput = true;
+                                lastExternalInput = DateTime.Now;
+                            }
                         }
-                        catch (Exception ex)
-                        {
-                            EverestAPI.Logger.Log(EverestAPI.LogLevel.Warn, "GymBridge", $"Parse error: {ex}");
-                        }
+                        catch { }
                     }
                 }
             }
-            catch (Exception ex)
+            catch (Exception e)
             {
-                EverestAPI.Logger.Log(EverestAPI.LogLevel.Warn, "GymBridge", $"Listener error: {ex.Message}");
+                EverestAPI.Logger.Log(EverestAPI.LogLevel.Warn, "GymBridge", $"Listener error: {e}");
             }
         }
 
-        private void SaveProgress()
+        private bool UsingHumanInput() =>
+            (DateTime.Now - lastExternalInput).TotalSeconds > 0.2;
+
+        private void SaveProgress(CelesteBase.Player player)
         {
-            var data = new
+            try
             {
-                cumulativeReward,
-                deathCount,
-                timestamp = DateTime.Now
-            };
-            File.WriteAllText(progressPath, JsonConvert.SerializeObject(data, Formatting.Indented));
+                var data = new
+                {
+                    player.Position.X,
+                    player.Position.Y,
+                    cumulativeReward,
+                    deathCount,
+                    timestamp = DateTime.Now,
+                };
+
+                string json = JsonConvert.SerializeObject(data, Formatting.Indented);
+
+                string tmp = progressPath + ".tmp";
+                File.WriteAllText(tmp, json);
+                File.Copy(tmp, progressPath, true);
+                File.Delete(tmp);
+
+                EverestAPI.Logger.Log(EverestAPI.LogLevel.Info, "GymBridge",
+                    $"Saved progress -> reward={cumulativeReward}, deaths={deathCount}");
+            }
+            catch (Exception e)
+            {
+                EverestAPI.Logger.Log(EverestAPI.LogLevel.Error, "GymBridge", $"SAVE FAILED: {e}");
+            }
         }
 
         private void LoadProgress()
         {
-            if (!File.Exists(progressPath))
-                return;
+            if (!File.Exists(progressPath)) return;
 
             try
             {
@@ -282,62 +301,37 @@ namespace GymBridge
             if (stream == null || !stream.CanWrite || player == null)
                 return;
 
-            bool exited = false;
+            bool exited = level.Transitioning || level.Completed;
             bool dead = player.Dead;
 
-            if (level.Transitioning || level.Completed)
-                exited = true;
-
             var pos = player.Position;
-            const int gridWidth = 32, gridHeight = 32, tileSize = 8;
-            int halfW = gridWidth / 2, halfH = gridHeight / 2;
+            const int W = 16, H = 16, tile = 8;
+            int halfW = W / 2, halfH = H / 2;
 
-            float originX = pos.X - halfW * tileSize;
-            float originY = pos.Y - halfH * tileSize;
+            float originX = pos.X - (W * tile) / 2f;
+            float originY = pos.Y - (H * tile) / 2f;
 
-            var solids = level.Tracker.GetEntities<celeste::Celeste.Solid>();
-            var spikes = level.Tracker.GetEntities<celeste::Celeste.Spikes>();
+            int[,] grid = new int[H, W];
 
-            int[,] grid = new int[gridHeight, gridWidth];
-
-            // --- Terrain sampling ---
-            for (int gy = 0; gy < gridHeight; gy++)
-            {
-                for (int gx = 0; gx < gridWidth; gx++)
+            for (int y = 0; y < H; y++)
+                for (int x = 0; x < W; x++)
                 {
-                    float worldX = originX + gx * tileSize + tileSize / 2f;
-                    float worldY = originY + gy * tileSize + tileSize / 2f;
-                    var checkPos = new Vector2(worldX, worldY);
+                    float wx = originX + x * tile;
+                    float wy = originY + y * tile;
+                    var rect = new Rectangle((int)wx - 2, (int)wy - 2, 4, 4);
 
-                    if (level.CollideCheck<celeste::Celeste.Solid>(checkPos))
-                        grid[gy, gx] = 1;
-                    else if (level.CollideCheck<celeste::Celeste.Spikes>(checkPos))
-                        grid[gy, gx] = 2;
-                    else
-                        grid[gy, gx] = 0;
+                    if (level.CollideCheck<celeste::Celeste.Solid>(rect)) grid[y, x] = 1;
+                    else if (level.CollideCheck<celeste::Celeste.Spikes>(rect)) grid[y, x] = 2;
+                    else grid[y, x] = 0;
                 }
-            }
 
+            grid[halfH, halfW] = 9;
 
-            grid[halfH, halfW] = 9; // player marker (optional visual)
-
-            // --- Compute approximate exit coordinate ---
-            Rectangle bounds = level.Bounds;
-
-            // Try to find a real ExitBlock entity first
-            // --- Compute real exit coordinate if present ---
             var exitBlock = level.Tracker.GetEntities<celeste::Celeste.ExitBlock>()?.FirstOrDefault();
-            Vector2? exitPos = null;
+            Vector2? exitPos = exitBlock?.Position;
 
-            if (exitBlock != null)
-            {
-                // Found a real exit block in the level
-                exitPos = exitBlock.Position;
-            }
-
-            // --- Serialize ---
-            var gridStrings = Enumerable.Range(0, gridHeight)
-                .Select(y => string.Join("", Enumerable.Range(0, gridWidth).Select(x => grid[y, x].ToString())))
+            var gridStrings = Enumerable.Range(0, H)
+                .Select(y => string.Join("", Enumerable.Range(0, W).Select(x => grid[y, x])))
                 .ToArray();
 
             var obs = new
@@ -353,15 +347,14 @@ namespace GymBridge
                     OnGround = player.OnGround(),
                     Facing = player.Facing.ToString()
                 },
-
-                Exit = exitPos.HasValue
-                    ? new { X = exitPos.Value.X, Y = exitPos.Value.Y }
-                    : null,
-
+                Exit = exitPos.HasValue ? new { X = exitPos.Value.X, Y = exitPos.Value.Y } : null,
                 Grid = gridStrings,
                 Done = exited || dead,
                 Reason = dead ? "death" : (exited ? "exit" : "none")
             };
+
+            if (UsingHumanInput())
+                demoFrames.Add(new RecordedFrame { Observation = obs, Input = latestInput });
 
             try
             {
@@ -371,21 +364,15 @@ namespace GymBridge
             }
             catch (Exception e)
             {
-                EverestAPI.Logger.Log(EverestAPI.LogLevel.Warn, "GymBridge", $"Failed to send observation: {e}");
+                EverestAPI.Logger.Log(EverestAPI.LogLevel.Warn, "GymBridge", $"Observation send fail: {e}");
             }
-
         }
-
     }
-
 
     public struct InputData
     {
-        public float MoveX;
-        public float MoveY;
-        public bool Jump;
-        public bool Dash;
-        public bool Grab;
+        public float MoveX, MoveY;
+        public bool Jump, Dash, Grab;
 
         public InputData(float[] arr)
         {
@@ -396,5 +383,10 @@ namespace GymBridge
             Grab = arr.Length > 4 && arr[4] > 0.5f;
         }
     }
-}
 
+    public class RecordedFrame
+    {
+        public object Observation;
+        public InputData Input;
+    }
+}
