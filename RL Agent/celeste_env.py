@@ -1,5 +1,5 @@
 from pyexpat import features
-from time import time
+import time
 import gymnasium
 import numpy as np
 import socket
@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 from gymnasium import spaces
 import os
 import pickle
+import csv
 
 
 class CelesteEnv(gymnasium.Env):
@@ -58,9 +59,8 @@ class CelesteEnv(gymnasium.Env):
         print("Action space:", self.action_space)
         print("Action space shape:", self.action_space.shape)
 
-        # Always initialize these
         self.last_action = np.zeros(5, dtype=np.float32)
-        self.hold_threshold = 0.5  # how strongly the NN has to press to start/keep holding
+        self.hold_threshold = 0.5 
         self.buffer = ""
         self.state = None
 
@@ -104,7 +104,6 @@ class CelesteEnv(gymnasium.Env):
         """
         # Clip to ensure valid ranges
         action = np.clip(action, self.action_space.low, self.action_space.high)
-        # Smooth hold behavior for jump/dash/grab
         hold_indices = [2, 3, 4]  # jump, dash, grab
 
         # Jump/dash are edge-triggered
@@ -127,25 +126,17 @@ class CelesteEnv(gymnasium.Env):
             except (BrokenPipeError, ConnectionResetError):
                 time.sleep(0.01)
 
-        # Receive new observation vector (this also sets self.last_msg to the raw JSON)
         obs = self._get_features()
 
-        # IMPORTANT: compute reward from the raw JSON message (self.last_msg),
-        # not from the processed observation vector.
         if not hasattr(self, "last_msg") or not isinstance(self.last_msg, dict):
-            # defensive debug output if something went wrong upstream
             print("Warning: last_msg missing or not a dict:", type(getattr(self, "last_msg", None)))
             reward, done = 0.0, False
         else:
             reward, done = self._compute_reward(self.last_msg)
-
-        # optionally update internal state used elsewhere
         self.state = obs
 
-        # live-plot bookkeeping (if you want to track these fields)
         if self.live_plot:
             try:
-                # try to collect some history fields if present in last_msg
                 p = self.last_msg.get("Player", {})
                 self.history["pos_x"].append(p.get("X", 0))
                 self.history["pos_y"].append(p.get("Y", 0))
@@ -186,7 +177,7 @@ class CelesteEnv(gymnasium.Env):
                 line, self.buffer = self.buffer.split("\n", 1)
                 try:
                     msg = json.loads(line)
-                    self.last_msg = msg         # <--- store for reward computation
+                    self.last_msg = msg       
                     return self._to_features(msg)
                 except json.JSONDecodeError:
                     continue
@@ -195,7 +186,6 @@ class CelesteEnv(gymnasium.Env):
         p = msg["Player"]
         self._save_input_snapshot(msg)
 
-        # Base player features (world units)
         pos_x = float(p["X"])
         pos_y = float(p["Y"])
         vel_x = float(p["Speed"]["X"])
@@ -218,7 +208,6 @@ class CelesteEnv(gymnasium.Env):
                 exit_dx_world = 0.0
                 exit_dy_world = 0.0
 
-        # Pack features into array (world units for pos and exit; we'll scale below)
         features = np.array([
             pos_x, pos_y,
             vel_x, vel_y,
@@ -230,7 +219,6 @@ class CelesteEnv(gymnasium.Env):
             exit_dy_world
         ], dtype=np.float32)
 
-        # Vision grid -> flattened numeric array
         grid = msg.get("Grid", [])
         grid_map = {
             "0": 0.0,   # air
@@ -244,8 +232,6 @@ class CelesteEnv(gymnasium.Env):
             dtype=np.float32
         ).flatten()
 
-
-        # Scale only position/velocity/exit so magnitudes stay reasonable for networks
         features_scaled = self._scale_features(features)
 
         return np.concatenate([features_scaled, vision])
@@ -262,11 +248,9 @@ class CelesteEnv(gymnasium.Env):
         if self._input_counter % 20 != 0:
             return
 
-        # --- Prepare directory ---
         os.makedirs("logs", exist_ok=True)
         fname_base = f"logs/input_{self._input_counter:05d}"
 
-        # --- Save raw input dict ---
         with open(fname_base + ".json", "w", encoding="utf-8") as f:
             json.dump(msg, f, indent=2)
                     
@@ -281,7 +265,7 @@ class CelesteEnv(gymnasium.Env):
         features[2] /= 100.0   # velX scale
         features[3] /= 100.0   # velY scale
 
-        # exit vector: scale to roughly same units as position (so /1000)
+        # exit vector: scale to roughly same units as position
         features[8] /= 1000.0
         features[9] /= 1000.0
 
@@ -302,95 +286,88 @@ class CelesteEnv(gymnasium.Env):
     # Reward
     # ==========================================================
     def _compute_reward(self, msg):
+        if not hasattr(self, "_step_count") or self._step_count is None:
+            self._step_count = 0
+            self._episode_start = time.time()
+
+        EXIT_X = 351.0
+        EXIT_Y = 88.0
+
+        # ---- Checkpoint location ----
+        CHECK_X = 195.0
+        CHECK_Y = 128.0
+        CHECK_RADIUS = 15.0
+
+        p = msg.get("Player", {})
+        x = float(p.get("X", 0.0))
+        y = float(p.get("Y", 0.0))
+
+        dist = np.sqrt((EXIT_X - x)**2 + (EXIT_Y - y)**2)
+
+        # ---- Initialize trackers ----
+        if not hasattr(self, "_last_dist") or self._last_dist is None:
+            self._last_dist = dist
+        if not hasattr(self, "_last_x") or self._last_x is None:
+            self._last_x = x
+        if not hasattr(self, "_checkpoint_reached"):
+            self._checkpoint_reached = False
+
         reward = 0.0
 
-        # -------------------------------
-        # Pull fields from message
-        # -------------------------------
-        player = msg["Player"]
-        pos_x = player["X"]
-        pos_y = player["Y"]
-        speed_x = player["Speed"]["X"]
-        speed_y = player["Speed"]["Y"]
-        on_ground = player["OnGround"]
+        # --- Progress ---
+        delta_x = x - self._last_x
+        reward += delta_x * 0.2
+        reward += (self._last_dist - dist) * 0.15
 
-        exit_info = msg["Exit"]      # None or {"X": ..., "Y": ...}
-        has_exit = exit_info is not None
+        if delta_x < -0.5: reward -= 0.5
+        if y > EXIT_Y + 40: reward -= 0.3
 
-        dead = msg.get("Done", False) and msg.get("Reason", "") == "dead"
+        reward += 0.05  # survival
 
-        # -------------------------------
-        # Initialize persistent variables
-        # -------------------------------
-        if not hasattr(self, "smooth_x"):
-            self.smooth_x = pos_x
-            self.smooth_y = pos_y
-            self.prev_sx = pos_x
-            self.prev_sy = pos_y
-            self.idle_steps = 0
-            self.best_dist = float("inf")
+        # ---- Checkpoint reward ----
+        cp_dist = np.sqrt((CHECK_X - x)**2 + (CHECK_Y - y)**2)
+        if not self._checkpoint_reached and cp_dist < CHECK_RADIUS:
+            reward += 25.0
+            self._checkpoint_reached = True
 
-        # -------------------------------
-        # Smooth position to remove frame noise
-        # -------------------------------
-        self.smooth_x = 0.9 * self.smooth_x + 0.1 * pos_x
-        self.smooth_y = 0.9 * self.smooth_y + 0.1 * pos_y
+        # ---- Success condition ----
+        done = dist < 7.0
+        self._step_count += 1 
 
-        delta_x = self.smooth_x - self.prev_sx
-        delta_y = self.smooth_y - self.prev_sy
+        if done:
+            reward += 75.0
 
-        self.prev_sx = self.smooth_x
-        self.prev_sy = self.smooth_y
+            end_time = time.time()
+            duration = end_time - self._episode_start
 
-        # -------------------------------
-        # Survival reward (tiny, steady)
-        # -------------------------------
-        reward += 0.05
+            # =======================
+            #   CSV LOGGING SECTION
+            # =======================
+            file_exists = os.path.isfile("runs.csv")
+            with open("runs.csv", "a", newline="") as f:
+                writer = csv.writer(f)
+                if not file_exists:
+                    writer.writerow(["episode", "steps", "duration_sec", "final_x", "final_y", "reward"])
+                writer.writerow([
+                    getattr(self, "_episode_num", 0),
+                    self._step_count,
+                    round(duration, 3),
+                    round(x, 2), round(y, 2),
+                    round(reward, 2)
+                ])
 
-        # -------------------------------
-        # Exit-progress reward
-        # -------------------------------
-        if has_exit:
-            exit_x = exit_info["X"]
-            exit_y = exit_info["Y"]
-            dist = ((pos_x - exit_x)**2 + (pos_y - exit_y)**2)**0.5
+            # Reset episode
+            self._episode_num = getattr(self, "_episode_num", 0) + 1
+            self._step_count = None
+            self._last_x = None
+            self._last_dist = None
+            self._checkpoint_reached = False
+            return reward, True
 
-            # reward only strictly forward progress
-            if dist < self.best_dist:
-                reward += 1.0
-                self.best_dist = dist
-
-        else:
-            # Tiny exploration shaping (biased toward right/up)
-            reward += 0.001 * (1 if delta_x > 0 else -1)
-            reward += 0.001 * (1 if delta_y < 0 else -1)
-
-        # -------------------------------
-        # Stuck penalty
-        # -------------------------------
-        if abs(delta_x) < 0.1 and abs(delta_y) < 0.1:
-            self.idle_steps += 1
-        else:
-            self.idle_steps = 0
-
-        if self.idle_steps > 20:
-            reward -= 0.5
-
-        # -------------------------------
-        # Death penalty (if the env reports death)
-        # -------------------------------
-        if dead:
-            reward -= 5.0
-
-        # -------------------------------
-        # Reward clamping for stability
-        # -------------------------------
-        reward = max(-1.0, min(1.0, reward))
-        done = dead 
-        return reward, done
-
-
-
+        # ---- Update state each step ----
+        self._last_x = x
+        self._last_dist = dist
+        return reward, False
 
 
     # ==========================================================
